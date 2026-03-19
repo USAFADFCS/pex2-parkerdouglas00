@@ -241,12 +241,82 @@ void* NPPcpu(void* param) {
 void* RRcpu(void* param) {
     int threadNum = ((CpuParams*) param)->threadNumber;
     SharedVars* svars = ((CpuParams*) param)->svars;
+    int numQuantum = 0;
 
-    // Process* p = NULL;  // TODO: uncomment when you implement this function
+    // p is the process currently running on this CPU.
+    // p == NULL means the CPU is idle and must pick a new process from readyQ.
+    Process* p = NULL;
 
+    // This thread runs forever — one loop iteration = one simulation timestep.
     while (1) {
+        // ── Sync point 1: wait for main to start this timestep ──────────
+        // main() posts cpuSems[threadNum] once per tick.  We block here
+        // until that post arrives, keeping this CPU in lockstep with the clock.
         sem_wait(svars->cpuSems[threadNum]);
 
+        // if process is still running but quantum number has been reached
+        if (p != NULL && numQuantum == 0) {
+            // lock to prevent changes in state while performing operation
+            pthread_mutex_lock(&(svars->readyQLock));
+            // set the requeued flag to true
+            p->requeued = true;
+            // re-insert process in queue
+            qInsert(&(svars->readyQ), p);
+            // unlock
+            pthread_mutex_unlock(&(svars->readyQLock));
+            // set process as NULL since process is done running
+            p = NULL;
+        }
+
+        // ── Selection (only when idle) ───────────────────────────────────
+        // RR is preemptive: once a process is running (p != NULL) we
+        // may replace it mid-burst.  We enter this block when the CPU
+        // has nothing to run or when Q time is reached.
+        if ((p == NULL)) {
+            // Lock readyQ before inspecting or modifying it — another CPU
+            // thread (or main inserting a new arrival) could touch it right now.
+            pthread_mutex_lock(&(svars->readyQLock));
+
+            // Index 0 = head of the list = the process that has been waiting
+            // the longest (qInsert always appends to the tail, so the head is
+            // always the oldest arrival — that is the RR selection rule).
+            p = qRemove(&(svars->readyQ), 0);
+
+            if (p == NULL) {
+                // readyQ was empty — CPU stays idle this tick.
+                printf("No process to schedule\n");
+            } else {
+                printf("Scheduling PID %d\n", p->PID);
+                numQuantum = svars->quantum;
+            }
+
+            pthread_mutex_unlock(&(svars->readyQLock));
+        }
+
+        // ── Execution: one unit of work ──────────────────────────────────
+        // If we have a process (carried over from a prior tick or just
+        // selected above), burn one unit of its remaining CPU burst.
+        if (p != NULL) {
+            p->burstRemaining--;
+            numQuantum--;
+
+            if (p->burstRemaining == 0) {
+                // Process is done — move it to finishedQ so main can
+                // compute and print wait-time statistics at simulation end.
+                pthread_mutex_lock(&(svars->finishedQLock));
+                qInsert(&(svars->finishedQ), p);
+                pthread_mutex_unlock(&(svars->finishedQLock));
+
+                // CPU is now idle; it will select a new process next tick.
+                p = NULL;
+
+                numQuantum = 0;
+            }
+        }
+
+        // ── Sync point 2: signal main that this CPU is done ─────────────
+        // main() waits on mainSem once per CPU per tick.  Posting here
+        // tells main this CPU has finished its work for the current timestep.
         sem_post(svars->mainSem);
     }
 }
